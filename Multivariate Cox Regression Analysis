@@ -1,0 +1,92 @@
+# Multivariate Cox Regression Analysis based on a previous study (OncoLnc)
+# survival ~ gene expression, age, and sex
+library(survival)
+library(survminer)
+library(dplyr)
+
+# data
+# https://xenabrowser.net/datapages/?cohort=TCGA%20Pan-Cancer%20(PANCAN)&removeHub=http%3A%2F%2F127.0.0.1%3A7222
+
+
+# clinical data
+meta <- read.csv('Survival_SupplementalTable_S1_20171025_xena_sp.tsv', sep = '\t', check.names = F)
+head(meta)
+
+rownames(meta) <- meta$sample
+
+meta <- meta[!is.na(meta$age_at_initial_pathologic_diagnosis),]
+
+meta$sex <- 0
+meta[meta$gender == "FEMALE",]$sex <- 1
+
+meta$cancer_loc <- substr(meta$sample, 14, 15)
+
+# table(meta$`cancer type abbreviation`, cancer_loc)
+
+# gene expression data
+data <- read.csv('EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.tsv', sep = '\t', check.names = F)
+data <- data[!duplicated(data[,1]),]
+data <- data[30:nrow(data),]
+rownames(data) <- data[,1]
+data <- data[,2:ncol(data)]
+
+
+list_sample = list()
+
+for(cancer_type in unique(meta$`cancer type abbreviation`)){
+# for(cancer_type in "BRCA"){
+    
+  if(cancer_type == "LAML"){
+    next()
+  }
+  
+  print(cancer_type)
+
+  # primary tumor except SKCM
+  sample_type = "01"
+  
+  if(cancer_type == "SKCM"){
+    sample_type = "06"
+  }
+  
+  meta_t <- meta[meta$`cancer type abbreviation` == cancer_type & meta$cancer_loc == sample_type,]
+  
+  samples <- intersect(meta_t$sample, colnames(data))
+  meta_t <- meta_t[samples,]
+  data_t <- data[,samples]
+  
+  # replace NA to 0
+  data_t[is.na(data_t)] <- 0
+  
+  # filter genes that is expressed at least one-fourth of the samples
+  genes <- rownames(data_t)[rowSums(data_t > 0) > (ncol(data_t) / 4)]
+  
+  list_res <- list()
+  
+  # cox-regression for all candidate genes
+  for(g in genes){
+    dft <- meta_t
+    dft$gene <- unlist(data_t[g,])
+    
+    # formula
+    frml_str <- paste("Surv(OS.time, OS) ~ age_at_initial_pathologic_diagnosis + sex + gene", sep = "")
+    
+    # cox regression
+    fit <- coxph(as.formula(frml_str), data = dft)
+    x <- summary(fit) 
+    
+    list_res[[g]] <- data.frame(gene = g, coef = x$coefficients["gene", "coef"], p = x$waldtest["pvalue"], mean_exp = mean(dft$gene), mediun_exp = median(dft$gene))
+    
+  }
+  
+  # output dataframe
+  res <- do.call('rbind', list_res)
+  
+  # adjust p value with fdr
+  res$p.adj <- p.adjust(res$p, method = 'fdr')
+  
+  res <- res %>% arrange(p.adj, p)
+  
+  write.csv(res, paste0('01_cox/', cancer_type, '.csv'))
+  
+}
