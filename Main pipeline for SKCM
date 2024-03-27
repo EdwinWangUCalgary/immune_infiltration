@@ -1,0 +1,503 @@
+library(TCGAbiolinks)
+library(survival)
+library(tidyverse)
+library(SingleCellExperiment)
+
+# Download and preprocess data
+# Download TPM, FPKM, or counts data
+# Query
+query_expr <- GDCquery(project = "TCGA-SKCM",
+                       data.category = "Transcriptome Profiling",
+                       data.type = "Gene Expression Quantification",
+                       workflow.type = "STAR - Counts")
+# Download
+GDCdownload(query_expr)
+
+# Prepare data
+se <- GDCprepare(query_expr)
+rowdata <- rowData(se)
+se_mrna <- se[rowdata$gene_type == "protein_coding",]
+# mRNA TPM, FPKM, or counts data
+expr_tpm_mrna <- assay(se_mrna, "tpm_unstrand")
+expr_fpkm_mrna <- assay(se_mrna, "fpkm_unstrand")
+expr_counts_mrna <- assay(se_mrna, "unstranded")
+# Change ensembl IDs to gene symbols
+# Alternatively, can also use the biomaRt package to transform ensembl IDs to gene symbols
+symbol_mrna <- rowData(se_mrna)$gene_name
+expr_tpm_mrna_symbol <- cbind(data.frame(symbol_mrna), as.data.frame(expr_tpm_mrna))
+# When transform from ensembl IDs to gene symbols, there would be duplicated gene symbols
+# Remove the duplciated gene symbols by keeping only the one with bigger average value
+# Reomove the genes with an average TPM < 1
+SKCM_tpm <- expr_tpm_mrna_symbol %>%
+  as_tibble() %>%
+  mutate(meanrow = rowMeans(.[,-1]), .before = 2) %>%
+  filter(meanrow >= 1) %>% # This line filters genes with mean TPM >= 1
+  arrange(desc(meanrow)) %>%
+  distinct(symbol_mrna, .keep_all = TRUE) %>%
+  select(-meanrow) %>%
+  column_to_rownames(var = "symbol_mrna") %>%
+  as.data.frame()
+
+# TCGA IDs only keep the first 15 characters
+colnames(SKCM_tpm) <- substr(colnames(SKCM_tpm), 1, 15)
+# Some samples have technical repeat, see blow
+value_counts<- table(colnames(SKCM_tpm))
+duplicated_counts <- value_counts[value_counts > 1]
+print(duplicated_counts)
+
+# As shown above, there technical repeats for some samples
+# For technical repeats, keep only one
+SKCM_tpm <- SKCM_tpm[, !duplicated(colnames(SKCM_tpm))]
+
+# 14 and 15 character in TCGA indicate the sample type
+# Check whether all the samples belong to tumor tissues
+chars_14_15 <- substr(colnames(SKCM_tpm), 14, 15)
+table(chars_14_15)
+# Keep only primary tumors for further calculation (i.e., "01")
+# Note: only solid tumors were included in our analysis, and for SKCM, metastasized tumors data were used (i.e., "06") instead
+selected_cols <- colnames(SKCM_tpm)[substr(colnames(SKCM_tpm), 14, 15) == "01"]
+# The resultant data is the clean dataset for mRNA (i.e., TPM) for only primary or metastasized tumors
+clean_SKCM_tpm <- SKCM_tpm[, selected_cols]
+# So now we can see that all 14-15 are either 01 or 06 (for SKCM only), which are primary solid tumors (for SKCM, metastasized tumors)
+chars_14_15 <- substr(colnames(clean_SKCM_tpm), 14, 15)
+table(chars_14_15)
+
+# Note：Download TCGA GISTIC2 thresholded gene level CNV data from xenobrowser website
+# Open the downloaded CNV data and preprocess
+SKCM_cnv <- read.delim("TCGA_SKCM_Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes",
+                       header = TRUE, check.names = FALSE)
+rownames(SKCM_cnv) <- SKCM_cnv$`Gene Symbol`
+SKCM_cnv$`Gene Symbol` <- NULL
+
+# Check whether there are technical repeats
+value_counts<- table(colnames(SKCM_cnv))
+duplicated_counts <- value_counts[value_counts > 1]
+print(duplicated_counts)
+
+# To remove any potential technical repeats
+SKCM_cnv <- SKCM_cnv[, !duplicated(colnames(SKCM_cnv))]
+value_counts<- table(colnames(SKCM_cnv))
+duplicated_counts <- value_counts[value_counts > 1]
+print(duplicated_counts)
+
+# Confirm whether all belong to specific tissue types (primary or metastasized tumors)
+chars_14_15 <- substr(colnames(SKCM_cnv), 14, 15)
+table(chars_14_15)
+# Keep only primary tumors for further calculation (i.e., "01")
+# Note: only solid tumors were included in our analysis, and for SKCM, metastasized tumors data were used (i.e., "06") instead
+selected_cols <- colnames(SKCM_cnv)[substr(colnames(SKCM_cnv), 14, 15) == "01"]
+# The resultant data is the clean dataset for CNV (i.e., GISTIC2 score) for only primary or metastasized tumors
+clean_SKCM_cnv <- SKCM_cnv[, selected_cols]
+# So now we can see that all 14-15 are 01, which are primary solid tumors
+chars_14_15 <- substr(colnames(clean_SKCM_cnv), 14, 15)
+table(chars_14_15)
+
+# Keep rows and columns that have the common rownames and common colnames
+# Find common columns and rows
+common_cols <- intersect(colnames(clean_SKCM_tpm), colnames(clean_SKCM_cnv))
+common_rows <- intersect(rownames(clean_SKCM_tpm), rownames(clean_SKCM_cnv))
+
+# Subset dataframes based on common columns and rows
+clean_SKCM_tpm_common <- clean_SKCM_tpm[common_rows, common_cols]
+clean_SKCM_cnv_common <- clean_SKCM_cnv[common_rows, common_cols]
+
+library(dplyr)
+library(purrr)
+cnv_data <- clean_SKCM_cnv_common
+expr_data <- clean_SKCM_tpm_common
+# Initialize a list to store the grouping results, named cnv_results but actually it is also restrained by GEX values
+cnv_results <- list()
+
+# Loop through each gene
+for (gene in rownames(cnv_data)) {
+  # take samples of which the gene is not amplified
+  samples_neg_cnv <- which(cnv_data[gene, ] %in% c(-2, -1, 0))
+  # take samples of which the gene is amplified
+  samples_pos_cnv <- which(cnv_data[gene, ] %in% c(1, 2))
+  
+  # rank the samples based on the expression value of that gene
+  expr_values <- expr_data[gene, ]
+  ranked_samples <- rank(expr_values, na.last = "keep", ties.method = "average")
+  
+  # Calculate thresholds for bottom 30% and top 30%
+  n_samples <- length(ranked_samples)
+  bottom_30_threshold <- 0.3 * n_samples
+  top_30_threshold <- 0.7 * n_samples
+  
+  # Find samples common in the groups classified according to both CNV and GEX
+  samples_neg_and_bottom_30 <- names(ranked_samples[samples_neg_cnv][ranked_samples[samples_neg_cnv] <= bottom_30_threshold])
+  samples_pos_and_top_30 <- names(ranked_samples[samples_pos_cnv][ranked_samples[samples_pos_cnv] > top_30_threshold])
+  
+  cnv_results[[gene]] <- list(neg_cnv_bottom_30 = samples_neg_and_bottom_30,
+                              pos_cnv_top_30 = samples_pos_and_top_30)
+}
+
+# Print the grouping results
+print(cnv_results)
+
+# Keep groups that have at least 30 samples in both the amplified and nonamplifed groups
+# keep only those with TCGA IDs not as NA.
+filtered_cnv_results <- keep(cnv_results, ~length(.$neg_cnv_bottom_30) >= 30 & length(.$pos_cnv_top_30) >= 30)
+final_SKCM_cnv_results <- discard(filtered_cnv_results, ~ any(is.na(unlist(.x))))
+
+# Print to check the filtered results
+print(final_SKCM_cnv_results)
+
+library(SummarizedExperiment)
+# TIL abundance data were downloaded form the TISIDB database
+# open the pre-calculated TIL abundance data
+load("SKCM_TIL.RData")
+SKCM_TIL <- TIL
+colnames(SKCM_TIL)
+
+# Preprocess, change . back to -
+colnames(SKCM_TIL) <- gsub("\\.", "-", colnames(SKCM_TIL))
+
+# Double confirm whether all the samples belong to tumor tissues
+chars_14_15 <- substr(colnames(SKCM_TIL), 14, 15)
+table(chars_14_15)
+# So we can see there are non-01 and > 10, we only take primary tumor samples (for SKCM, take 06)
+selected_cols <- colnames(SKCM_TIL)[substr(colnames(SKCM_TIL), 14, 15) == "01"]
+clean_SKCM_TIL <- SKCM_TIL[, selected_cols]
+# So now all samples are 01, belonging to primary solid tumors
+chars_14_15 <- substr(colnames(clean_SKCM_TIL), 14, 15)
+table(chars_14_15)
+
+# For TPM dataframe, take only genes that passed the CNV requirement
+clean_SKCM_tpm_filtered <- subset(clean_SKCM_tpm, row.names(clean_SKCM_tpm) %in% names(final_SKCM_cnv_results))
+
+# Transpose the TPM and TIL dataframes
+clean_SKCM_tpm_filtered_t <- as.data.frame(t(clean_SKCM_tpm_filtered))
+clean_SKCM_TIL_t <- as.data.frame(t(clean_SKCM_TIL))
+# Merge the two dataframes
+SKCM_tpm_TIL <- merge(clean_SKCM_tpm_filtered_t, clean_SKCM_TIL_t, by = "row.names")
+rownames(SKCM_tpm_TIL) <- SKCM_tpm_TIL$Row.names
+SKCM_tpm_TIL$Row.names <- NULL
+
+# Calculate the correlations and p-values between expression and activated_CD8_T
+cor_results <- sapply(SKCM_tpm_TIL[, -c((ncol(SKCM_tpm_TIL)-27):ncol(SKCM_tpm_TIL))], function(column) {
+  test <- cor.test(column, SKCM_tpm_TIL[, ncol(SKCM_tpm_TIL)-27], method = "spearman")
+  c(correlation = test$estimate, p.value = test$p.value)
+})
+
+SKCM_expr_T_activated <- as.data.frame(t(cor_results))
+SKCM_expr_T_activated$adjusted.p.value <- p.adjust(SKCM_expr_T_activated$p.value, method = "BH")
+
+# filtering criteria
+SKCM_expr_T_activated_filtered <- SKCM_expr_T_activated[SKCM_expr_T_activated$correlation.rho < -0.2 & SKCM_expr_T_activated$adjusted.p.value < 0.01, ]
+
+
+library(GSVA)
+expr_matrix <- as.matrix(clean_SKCM_tpm)
+# geneSets.csv include the 12 VIGex signature genes
+gene_list <- read.csv("geneSets.csv", header = TRUE, stringsAsFactors = FALSE)
+geneSets <- gene_list$genes
+geneSets <- list(geneSets)
+
+gsvaPar <- gsvaParam(expr_matrix, geneSets, kcdf="Poisson")
+gsva.es <- gsva(gsvaPar, verbose=FALSE)
+rownames(gsva.es) <- "gsva.es"
+
+# Use only filtered genes in last step
+clean_SKCM_tpm_filtered <- subset(clean_SKCM_tpm, row.names(clean_SKCM_tpm) %in% row.names(SKCM_expr_T_activated_filtered))
+SKCM_tpm_ssGSEA <- rbind(gsva.es,clean_SKCM_tpm_filtered)
+
+SKCM_tpm_ssGSEA_t <- t(SKCM_tpm_ssGSEA)
+
+results_list <- list()
+
+for (i in 2:ncol(SKCM_tpm_ssGSEA_t)) {
+  column <- SKCM_tpm_ssGSEA_t[, i]
+  test <- cor.test(column, SKCM_tpm_ssGSEA_t[, 1], method = "spearman")
+  results_list[[colnames(SKCM_tpm_ssGSEA_t)[i]]] <- c(cor_coefficient = test$estimate, p_value = test$p.value)
+}
+
+# Convert the list to a dataframe
+SKCM_expr_immune_markers <- as.data.frame(do.call(rbind, results_list))
+SKCM_expr_immune_markers$adjusted.p.value <- p.adjust(SKCM_expr_immune_markers$p_value, method = "BH")
+# filtering criteria
+SKCM_expr_immune_markers_filtered <- SKCM_expr_immune_markers[SKCM_expr_immune_markers$cor_coefficient.rho < -0.20 & SKCM_expr_immune_markers$adjusted.p.value < 0.01, ]
+
+library(readxl)
+
+# A multivariate analysis was performed separately (survival ~ gene_expression, age, sex), see code in another file
+# Load excel named mRNA_survival.xlsx which contains correlation coefficients and p or adj. p values
+SKCM_expr_survival_coef <- read_excel("mRNA_survival.xlsx", sheet = "SKCM")
+# Remove last column
+SKCM_expr_survival_coef <- as.data.frame(SKCM_expr_survival_coef)
+SKCM_expr_survival_coef <- SKCM_expr_survival_coef[, -((ncol(SKCM_expr_survival_coef)-2):ncol(SKCM_expr_survival_coef))]
+# Set first row as rownames
+row.names(SKCM_expr_survival_coef) <- SKCM_expr_survival_coef[, 1]
+SKCM_expr_survival_coef <- select(SKCM_expr_survival_coef, -1)
+# Include only genes passed the above criteria
+SKCM_expr_survival_coef <- subset(SKCM_expr_survival_coef, row.names(SKCM_expr_survival_coef) %in% row.names(SKCM_expr_immune_markers_filtered))
+# Perform FDR correction
+SKCM_expr_survival_coef$adjusted.p <- p.adjust(SKCM_expr_survival_coef$p, method = "BH")
+
+# filtering criteria
+SKCM_expr_survival_multivariate_filtered <- subset(SKCM_expr_survival_coef, coef > 0.15)
+#SKCM_expr_survival_multivariate_filtered <- subset(SKCM_expr_survival_coef, coef > 0.10 & adjusted.p < 0.05 & adjusted.p < 0.05)
+
+# K-M survival analysis for each gene
+library(survminer)
+
+# TPM data is cleaned and ready as above
+# Download and Prepare Clinical Data
+#Download TCGA-SKCM clinical data, please note, the patients IDs already contain only the first 12 characters
+SKCM_clinical <- GDCquery_clinic(project = "TCGA-SKCM", type = "clinical")
+
+#Extract the survival data
+survival_data <- SKCM_clinical[, c("bcr_patient_barcode", "days_to_last_follow_up", "vital_status")]
+colnames(survival_data) <- c("patient_id", "OS.time", "OS.status")
+
+#Define "Dead" as 1 and otherwise as 0, which is used for later survival plotting
+survival_data$OS.status <- ifelse(survival_data$OS.status == "Dead", 1, 0)
+clean_SKCM_tpm_temp <- subset(clean_SKCM_tpm, row.names(clean_SKCM_tpm) %in% row.names(SKCM_expr_survival_multivariate_filtered))
+colnames(clean_SKCM_tpm_temp) <- substr(colnames(clean_SKCM_tpm_temp), 1, 12)
+
+# Initialize an empty dataframe to store the p-values
+SKCM_surv_results <- data.frame(Gene = character(), P_value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each gene in the data
+for (gene in rownames(clean_SKCM_tpm_temp)) {
+  
+  # Print the current gene name
+  print(paste("Processing gene:", gene))
+  
+  # Use tryCatch to catch errors
+  tryCatch({
+    # Extract expression data for the current gene
+    gene.data <- subset(clean_SKCM_tpm_temp, rownames(clean_SKCM_tpm_temp) == gene)
+    
+    # Convert to a dataframe for merging
+    gene.df <- as.data.frame(t(gene.data))
+    gene.df$patient_id <- rownames(gene.df)
+    
+    # Merge the clinical data with the gene expression data
+    merged.data <- merge(survival_data, gene.df, by = "patient_id")
+    
+    # Remove rows with NA values
+    merged.data <- na.omit(merged.data)
+    
+    # Determine optimal cutpoint for the current gene
+    cutpoint <- surv_cutpoint(merged.data, time = "OS.time", event = "OS.status", variables = gene)
+    
+    # Check if cutpoint is valid (you can define your own condition)
+    if (is.na(cutpoint$cutpoint[[1]])) {
+      print("Invalid cutpoint, skipping this gene.")
+      next
+    }
+    
+    # Create a factor variable based on the cutpoint
+    merged.data$group <- ifelse(merged.data[, gene] > cutpoint$cutpoint[[1]], "High", "Low")
+    
+    # Compute the log-rank test
+    logrank_test <- survdiff(Surv(OS.time, OS.status) ~ group, data = merged.data)
+    
+    # Store the p-value in the results dataframe
+    SKCM_surv_results <- rbind(SKCM_surv_results, data.frame(Gene = gene, P_value = logrank_test$pval))
+    
+  }, error = function(e) {
+    # Print or save the error message
+    print(paste("Error occurred:", e))
+  })
+}
+
+SKCM_surv_results$adjusted_P_value <- p.adjust(SKCM_surv_results$P_value, method = "BH")
+SKCM_expr_survival_KM <- SKCM_surv_results
+rownames(SKCM_expr_survival_KM) <- SKCM_expr_survival_KM[, 1]
+SKCM_expr_survival_KM$Gene <- NULL
+# Take only genes with adjusted p < 0.15
+SKCM_expr_survival_KM_filtered <- SKCM_expr_survival_KM[SKCM_expr_survival_KM$adjusted_P_value < 0.15, ]
+
+# Merge above 4 tables
+# Modify column names
+SKCM_expr_T_activated_filtered <- SKCM_expr_T_activated_filtered %>% rename_with(~paste0("expr_T_activated_", .), everything())
+SKCM_expr_immune_markers_filtered <- SKCM_expr_immune_markers_filtered %>% rename_with(~paste0("expr_immune_markers_", .), everything())
+SKCM_expr_survival_multivariate_filtered <- SKCM_expr_survival_multivariate_filtered %>% rename_with(~paste0("expr_survival_multivariate_", .), everything())
+SKCM_expr_survival_KM_filtered <- SKCM_expr_survival_KM_filtered %>% rename_with(~paste0("expr_survival_KM_", .), everything())
+# keep only rows of common genes
+SKCM_expr_T_activated_filtered <- subset(SKCM_expr_T_activated_filtered, row.names(SKCM_expr_T_activated_filtered) %in% row.names(SKCM_expr_survival_KM_filtered))
+SKCM_expr_immune_markers_filtered <- subset(SKCM_expr_immune_markers_filtered, row.names(SKCM_expr_immune_markers_filtered) %in% row.names(SKCM_expr_survival_KM_filtered))
+SKCM_expr_survival_multivariate_filtered <- subset(SKCM_expr_survival_multivariate_filtered, row.names(SKCM_expr_survival_multivariate_filtered) %in% row.names(SKCM_expr_survival_KM_filtered))
+
+# Merge all 4 files
+# Merge the data frames based on common row names without creating duplicate 'Row.names' columns
+SKCM_gene_list <- Reduce(function(x, y) {
+  # Merge using row names directly
+  merged_df <- merge(x, y, by = "row.names", all = FALSE)
+  # Set the row names of the merged data frame and remove the 'Row.names' column
+  row.names(merged_df) <- merged_df$Row.names
+  merged_df$Row.names <- NULL
+  return(merged_df)
+}, list(SKCM_expr_T_activated_filtered, SKCM_expr_immune_markers_filtered, SKCM_expr_survival_multivariate_filtered, SKCM_expr_survival_KM_filtered))
+
+# Write csv file
+write.csv(SKCM_expr_T_activated, "SKCM_expr_T_activated.csv")
+write.csv(SKCM_expr_immune_markers, "SKCM_expr_immune_markers.csv")
+write.csv(SKCM_expr_survival_coef, "SKCM_expr_survival_coef.csv")
+write.csv(SKCM_expr_survival_KM, "SKCM_expr_survival_KM.csv")
+write.csv(SKCM_expr_T_activated_filtered, "SKCM_expr_T_activated_filtered.csv")
+write.csv(SKCM_expr_immune_markers_filtered, "SKCM_expr_immune_markers_filtered.csv")
+write.csv(SKCM_expr_survival_multivariate_filtered, "SKCM_expr_survival_multivariate_filtered.csv")
+write.csv(SKCM_expr_survival_KM_filtered, "SKCM_expr_survival_KM_filtered.csv")
+write.csv(SKCM_gene_list, "SKCM_gene_list.csv") 
+
+# Prepare counts data for following DESeq2 calculation
+expr_counts_mrna_symbol <- cbind(data.frame(symbol_mrna), as.data.frame(expr_counts_mrna))
+# When transform from ensembl IDs to gene symbols, there would be duplicated gene symbols
+# Remove the duplciated gene symbols by keeping only the one with bigger average value
+# Reomove the genes with an average ccount number < 10
+BLCA_counts <- expr_counts_mrna_symbol %>%
+  as_tibble() %>%
+  mutate(meanrow = rowMeans(.[,-1]), .before = 2) %>%
+  filter(meanrow >= 10) %>% # This line filters genes with mean count >= 10
+  arrange(desc(meanrow)) %>%
+  distinct(symbol_mrna, .keep_all = TRUE) %>%
+  dplyr::select(-meanrow) %>%
+  column_to_rownames(var = "symbol_mrna") %>%
+  as.data.frame()
+
+# TCGA IDs only keep the first 15 characters
+colnames(BLCA_counts) <- substr(colnames(BLCA_counts), 1, 15)
+# Some samples have technical repeat, see blow
+value_counts<- table(colnames(BLCA_counts))
+duplicated_counts <- value_counts[value_counts > 1]
+print(duplicated_counts)
+
+# As shown above, there technical repeats for some samples
+BLCA_counts <- BLCA_counts[, !duplicated(colnames(BLCA_counts))]
+
+# 14 and 15 character in TCGA indicate the sample type
+# Check whether all the samples belong to tumor tissues
+chars_14_15 <- substr(colnames(BLCA_counts), 14, 15)
+table(chars_14_15)
+# So we can see there are non-01 and > 10, we only take primary tumor samples
+selected_cols <- colnames(BLCA_counts)[substr(colnames(BLCA_counts), 14, 15) == "01"]
+clean_BLCA_counts <- BLCA_counts[, selected_cols]
+# So now we can see that all 14-15 are 01, which are primary solid tumors
+chars_14_15 <- substr(colnames(clean_BLCA_counts), 14, 15)
+table(chars_14_15)
+
+# Load library
+library(parallel)
+# Define the number of cores to use
+n_cores <- 16
+print(paste0("n cores are:", n_cores))
+
+# Create a cluster using the specified number of cores
+cl <- makeCluster(n_cores)
+
+# Load necessary libraries on each node
+clusterEvalQ(cl, {
+  library(DESeq2)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+})
+
+# Export necessary variables to the cluster
+clusterExport(cl, c("final_BLCA_cnv_results", "clean_BLCA_counts"))
+
+# Initialize your results list
+results_list <- list()
+
+# Define your analysis as a function
+analyze_gene <- function(gene) {
+  
+  # Get the sample names for group 1 and group 2
+  group1_samples <- final_BLCA_cnv_results[[gene]][[1]]
+  group2_samples <- final_BLCA_cnv_results[[gene]][[2]]
+  
+  # Extract only counts data for the current genes
+  clean_BLCA_counts_subset <- clean_BLCA_counts[, colnames(clean_BLCA_counts) %in% c(group1_samples, group2_samples)]
+  
+  # Create a data frame to store sample group info
+  sample_info <- data.frame(
+    sample_name = colnames(clean_BLCA_counts_subset),
+    group = ifelse(colnames(clean_BLCA_counts_subset) %in% group1_samples, "Group1", "Group2")
+  )
+  
+  # Relevel the group factor to make 'Group2' the reference level
+  sample_info$group <- as.factor(sample_info$group)
+  sample_info$group <- relevel(sample_info$group, ref = "Group2")
+  
+  # Create DESeqDataSet object
+  dds <- DESeqDataSetFromMatrix(
+    countData = clean_BLCA_counts_subset,
+    colData = sample_info,
+    design = ~ group
+  )
+  
+  # Run DESeq2 analysis
+  dds <- DESeq(dds)
+  
+  # Get results
+  res <- results(dds)
+  log2FC <- res$log2FoldChange
+  log2FC_genenames <- rownames(res)
+  gene_log2FC <- data.frame(gene = log2FC_genenames, log2FoldChange = log2FC)
+  gene_log2FC <- gene_log2FC[order(-gene_log2FC$log2FoldChange), ]
+  gene_log2FC <- gene_log2FC[!is.na(gene_log2FC$log2FoldChange),]
+  rownames(gene_log2FC) <- gene_log2FC[,1]
+  gene_log2FC <- gene_log2FC[, -1, drop = FALSE]
+  temp <- rownames(gene_log2FC)
+  
+  gene_log2FC <- as.numeric(gene_log2FC$log2FoldChange)
+  names(gene_log2FC) <- temp
+  
+  
+  # Perform GO analysis using clusterProfiler
+  gsea_result <- gseGO(
+    geneList = gene_log2FC,
+    OrgDb = org.Hs.eg.db,
+    ont = "ALL",
+    keyType = "SYMBOL",
+    minGSSize = 10,
+    maxGSSize = 500,
+    pvalueCutoff = 0.05,
+    pAdjustMethod = "BH",
+    verbose = FALSE
+  )
+  
+  # Initialize counters for the number of terms that meet the criteria
+  immune_term_count <- 0
+  antigen_MHC_term_count <- 0
+  
+  # Extract results for each ontology
+  for (ont in c("BP", "CC", "MF")) {
+    ont_result <- gsea_result[gsea_result$ONTOLOGY == ont,]
+    
+    # Filter based on adjusted p-value
+    filtered_result <- ont_result[ont_result$pvalue < 0.05 & ont_result$p.adjust < 0.25, ]
+    
+    # Filter based on immune-related keywords
+    immune_keyword_filtered_result <- filtered_result[grep("cytokine|interferon|interleukin|chemokine", filtered_result$Description, ignore.case = TRUE), ]
+    immune_keyword_filtered_result <- immune_keyword_filtered_result[!grepl("cytokinesis|cytokinetic", immune_keyword_filtered_result$Description, ignore.case = TRUE), ]
+    immune_term_count <- immune_term_count + nrow(immune_keyword_filtered_result)
+    
+    # Filter based on antigen and MHC keywords
+    antigen_MHC_keyword_filtered_result <- filtered_result[grep("antigen|MHC", filtered_result$Description, ignore.case = TRUE), ]
+    antigen_MHC_term_count <- antigen_MHC_term_count + nrow(antigen_MHC_keyword_filtered_result)
+  }
+  
+  # Return a list with results
+  return(list("gene" = gene, "immune_term_count" = immune_term_count, "antigen_MHC_term_count" = antigen_MHC_term_count))
+}
+# results_list is the list output from the parLapply function
+BLCA_screened_list <- row.names(BLCA_gene_list)
+results_list <- parLapply(cl, BLCA_screened_list, analyze_gene)
+# Stop the cluster
+stopCluster(cl)
+# Convert the list of lists into a data frame
+immune_pathway_df <- do.call(rbind, lapply(results_list, function(x) data.frame(t(unlist(x)))))
+write.csv(immune_pathway_df, "BLCA_immune_pathway_df.csv")
+
+rownames(immune_pathway_df) <- immune_pathway_df[, 1]
+immune_pathway_df <- immune_pathway_df[, -1]
+# modify column names
+immune_pathway_df <- immune_pathway_df %>% rename_with(~paste0("immune_pathway", .), everything())
+
+# merge with above dataframe
+BLCA_gene_list_final <- merge(BLCA_gene_list, immune_pathway_df, by = "row.names")
+
+write.csv(BLCA_gene_list_final, "BLCA_gene_list_final.csv")
