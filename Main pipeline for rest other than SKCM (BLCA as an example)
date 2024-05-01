@@ -308,8 +308,8 @@ COAD_surv_results$adjusted_P_value <- p.adjust(COAD_surv_results$P_value, method
 COAD_expr_survival_KM <- COAD_surv_results
 rownames(COAD_expr_survival_KM) <- COAD_expr_survival_KM[, 1]
 COAD_expr_survival_KM$Gene <- NULL
-# Take only genes with adjusted p < 0.15
-COAD_expr_survival_KM_filtered <- COAD_expr_survival_KM[COAD_expr_survival_KM$adjusted_P_value < 0.15, ]
+# Take only genes with adjusted p < 0.05, this value can be higher to cover more genes if necessary
+COAD_expr_survival_KM_filtered <- COAD_expr_survival_KM[COAD_expr_survival_KM$adjusted_P_value < 0.05, ]
 
 # Merge above 4 tables
 # Modify column names
