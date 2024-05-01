@@ -307,8 +307,8 @@ SKCM_surv_results$adjusted_P_value <- p.adjust(SKCM_surv_results$P_value, method
 SKCM_expr_survival_KM <- SKCM_surv_results
 rownames(SKCM_expr_survival_KM) <- SKCM_expr_survival_KM[, 1]
 SKCM_expr_survival_KM$Gene <- NULL
-# Take only genes with adjusted p < 0.15
-SKCM_expr_survival_KM_filtered <- SKCM_expr_survival_KM[SKCM_expr_survival_KM$adjusted_P_value < 0.15, ]
+# Take only genes with adjusted p < 0.05, this value can be higher to cover more genes if necessary
+SKCM_expr_survival_KM_filtered <- SKCM_expr_survival_KM[SKCM_expr_survival_KM$adjusted_P_value < 0.05, ]
 
 # Merge above 4 tables
 # Modify column names
@@ -348,7 +348,7 @@ expr_counts_mrna_symbol <- cbind(data.frame(symbol_mrna), as.data.frame(expr_cou
 # When transform from ensembl IDs to gene symbols, there would be duplicated gene symbols
 # Remove the duplciated gene symbols by keeping only the one with bigger average value
 # Reomove the genes with an average ccount number < 10
-BLCA_counts <- expr_counts_mrna_symbol %>%
+SKCM_counts <- expr_counts_mrna_symbol %>%
   as_tibble() %>%
   mutate(meanrow = rowMeans(.[,-1]), .before = 2) %>%
   filter(meanrow >= 10) %>% # This line filters genes with mean count >= 10
@@ -359,24 +359,24 @@ BLCA_counts <- expr_counts_mrna_symbol %>%
   as.data.frame()
 
 # TCGA IDs only keep the first 15 characters
-colnames(BLCA_counts) <- substr(colnames(BLCA_counts), 1, 15)
+colnames(SKCM_counts) <- substr(colnames(SKCM_counts), 1, 15)
 # Some samples have technical repeat, see blow
-value_counts<- table(colnames(BLCA_counts))
+value_counts<- table(colnames(SKCM_counts))
 duplicated_counts <- value_counts[value_counts > 1]
 print(duplicated_counts)
 
 # As shown above, there technical repeats for some samples
-BLCA_counts <- BLCA_counts[, !duplicated(colnames(BLCA_counts))]
+SKCM_counts <- SKCM_counts[, !duplicated(colnames(SKCM_counts))]
 
 # 14 and 15 character in TCGA indicate the sample type
 # Check whether all the samples belong to tumor tissues
-chars_14_15 <- substr(colnames(BLCA_counts), 14, 15)
+chars_14_15 <- substr(colnames(SKCM_counts), 14, 15)
 table(chars_14_15)
 # So we can see there are non-01 and > 10, we only take primary tumor samples
-selected_cols <- colnames(BLCA_counts)[substr(colnames(BLCA_counts), 14, 15) == "01"]
-clean_BLCA_counts <- BLCA_counts[, selected_cols]
+selected_cols <- colnames(SKCM_counts)[substr(colnames(SKCM_counts), 14, 15) == "01"]
+clean_SKCM_counts <- SKCM_counts[, selected_cols]
 # So now we can see that all 14-15 are 01, which are primary solid tumors
-chars_14_15 <- substr(colnames(clean_BLCA_counts), 14, 15)
+chars_14_15 <- substr(colnames(clean_SKCM_counts), 14, 15)
 table(chars_14_15)
 
 # Load library
@@ -396,7 +396,7 @@ clusterEvalQ(cl, {
 })
 
 # Export necessary variables to the cluster
-clusterExport(cl, c("final_BLCA_cnv_results", "clean_BLCA_counts"))
+clusterExport(cl, c("final_SKCM_cnv_results", "clean_SKCM_counts"))
 
 # Initialize your results list
 results_list <- list()
@@ -405,16 +405,16 @@ results_list <- list()
 analyze_gene <- function(gene) {
   
   # Get the sample names for group 1 and group 2
-  group1_samples <- final_BLCA_cnv_results[[gene]][[1]]
-  group2_samples <- final_BLCA_cnv_results[[gene]][[2]]
+  group1_samples <- final_SKCM_cnv_results[[gene]][[1]]
+  group2_samples <- final_SKCM_cnv_results[[gene]][[2]]
   
   # Extract only counts data for the current genes
-  clean_BLCA_counts_subset <- clean_BLCA_counts[, colnames(clean_BLCA_counts) %in% c(group1_samples, group2_samples)]
+  clean_SKCM_counts_subset <- clean_SKCM_counts[, colnames(clean_SKCM_counts) %in% c(group1_samples, group2_samples)]
   
   # Create a data frame to store sample group info
   sample_info <- data.frame(
-    sample_name = colnames(clean_BLCA_counts_subset),
-    group = ifelse(colnames(clean_BLCA_counts_subset) %in% group1_samples, "Group1", "Group2")
+    sample_name = colnames(clean_SKCM_counts_subset),
+    group = ifelse(colnames(clean_SKCM_counts_subset) %in% group1_samples, "Group1", "Group2")
   )
   
   # Relevel the group factor to make 'Group2' the reference level
@@ -423,7 +423,7 @@ analyze_gene <- function(gene) {
   
   # Create DESeqDataSet object
   dds <- DESeqDataSetFromMatrix(
-    countData = clean_BLCA_counts_subset,
+    countData = clean_SKCM_counts_subset,
     colData = sample_info,
     design = ~ group
   )
@@ -484,13 +484,13 @@ analyze_gene <- function(gene) {
   return(list("gene" = gene, "immune_term_count" = immune_term_count, "antigen_MHC_term_count" = antigen_MHC_term_count))
 }
 # results_list is the list output from the parLapply function
-BLCA_screened_list <- row.names(BLCA_gene_list)
-results_list <- parLapply(cl, BLCA_screened_list, analyze_gene)
+SKCM_screened_list <- row.names(SKCM_gene_list)
+results_list <- parLapply(cl, SKCM_screened_list, analyze_gene)
 # Stop the cluster
 stopCluster(cl)
 # Convert the list of lists into a data frame
 immune_pathway_df <- do.call(rbind, lapply(results_list, function(x) data.frame(t(unlist(x)))))
-write.csv(immune_pathway_df, "BLCA_immune_pathway_df.csv")
+write.csv(immune_pathway_df, "SKCM_immune_pathway_df.csv")
 
 rownames(immune_pathway_df) <- immune_pathway_df[, 1]
 immune_pathway_df <- immune_pathway_df[, -1]
@@ -498,6 +498,6 @@ immune_pathway_df <- immune_pathway_df[, -1]
 immune_pathway_df <- immune_pathway_df %>% rename_with(~paste0("immune_pathway", .), everything())
 
 # merge with above dataframe
-BLCA_gene_list_final <- merge(BLCA_gene_list, immune_pathway_df, by = "row.names")
+SKCM_gene_list_final <- merge(SKCM_gene_list, immune_pathway_df, by = "row.names")
 
-write.csv(BLCA_gene_list_final, "BLCA_gene_list_final.csv")
+write.csv(SKCM_gene_list_final, "SKCM_gene_list_final.csv")
